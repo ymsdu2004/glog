@@ -781,11 +781,14 @@ func stacks(all bool) []byte {
 // would make its use clumsier.
 var logExitFunc func(error)
 
+// 出现创建和写文件等严重错误时的退出动作
+// 先冲刷最后的日志到文件,然后退出进程
 // exit is called if there is trouble creating or writing log files.
 // It flushes the logs and exits the program; there's no point in hanging around.
 // l.mu is held.
 func (l *loggingT) exit(err error) {
 	fmt.Fprintf(os.Stderr, "log: exiting because of error: %s\n", err)
+	// 如果存在退出日志回调函数,则执行该函数,否则直接退出进程
 	// If logExitFunc is set, we do that instead of exiting.
 	if logExitFunc != nil {
 		logExitFunc(err)
@@ -795,6 +798,8 @@ func (l *loggingT) exit(err error) {
 	os.Exit(2)
 }
 
+// syncBuffer为一个日志及其底层文件绑定了一个bufio.Writer,他封装了日志文件的写操作,屏蔽了
+// 文件rotation的逻辑,注意：改类型的所有方法执行的时候必须持有该日志的mutx
 // syncBuffer joins a bufio.Writer to its underlying file, providing access to the
 // file's Sync method and providing a wrapper for the Write method that provides log
 // file rotation. There are conflicting methods, so the file cannot be embedded.
@@ -807,19 +812,27 @@ type syncBuffer struct {
 	nbytes uint64 // The number of bytes written to this file
 }
 
+// 同步内存数据到文件
 func (sb *syncBuffer) Sync() error {
 	return sb.file.Sync()
 }
 
+// 写入数据,注意：方法执行是在logger的mutex保护下进行的
 func (sb *syncBuffer) Write(p []byte) (n int, err error) {
+	// 如果当前要写入的数据会导致日志文件大小超过最大阈值,则rotate文件
+	// 即会新创建一个文件,并建立软连接,此条及后面的日志都将写入新的文件
 	if sb.nbytes+uint64(len(p)) >= MaxSize {
 		if err := sb.rotateFile(time.Now()); err != nil {
+			// 回转文件失败则会退出进程
 			sb.logger.exit(err)
 		}
 	}
+	
+	// 写入数据
 	n, err = sb.Writer.Write(p)
 	sb.nbytes += uint64(n)
 	if err != nil {
+		// 写入数据失败也将退出进程
 		sb.logger.exit(err)
 	}
 	return
@@ -834,27 +847,38 @@ func (sb *syncBuffer) rotateFile(now time.Time) error {
 	var err error
 	sb.file, _, err = create(severityName[sb.sev], now)
 	sb.nbytes = 0
-	if err != nil {
+	if err != nil { // 创建新日志文件失败会返回错误,进而退出进程
 		return err
 	}
 
+	// 创建新的Writer,以关联到该新的文件
 	sb.Writer = bufio.NewWriterSize(sb.file, bufferSize)
 
+	// 每个日志文件的开头都会有几行文件头
+	// 包含:
+	// 文件的创建时间
+	// 当前机器名
+	// 进程的构建环境
+	// 日志行格式,glog中格式是写死的
 	// Write header.
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "Log file created at: %s\n", now.Format("2006/01/02 15:04:05"))
 	fmt.Fprintf(&buf, "Running on machine: %s\n", host)
 	fmt.Fprintf(&buf, "Binary: Built with %s %s for %s/%s\n", runtime.Compiler, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	fmt.Fprintf(&buf, "Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg\n")
+	
+	// 写入文件头
 	n, err := sb.file.Write(buf.Bytes())
 	sb.nbytes += uint64(n)
 	return err
 }
 
+// Writer的buffer大小,glog中该值是固定的,设为256M,设置为这么大的原因在于可以积累较多的日志
+// 以避免调用日志的工作线程出现I/O阻塞，相反将这项开箱用flushDaemon这个单独的groutine来取代
 // bufferSize sizes the buffer associated with each log file. It's large
 // so that log records can accumulate without the logging thread blocking
 // on disk I/O. The flushDaemon will block instead.
-const bufferSize = 256 * 1024
+const bufferSize = 256 * 1024 // 256M
 
 // createFiles creates all the log files for severity from sev down to infoLog.
 // l.mu is held.
@@ -875,11 +899,16 @@ func (l *loggingT) createFiles(sev severity) error {
 	return nil
 }
 
+// 默认日志冲刷时间30秒
 const flushInterval = 30 * time.Second
 
 // flushDaemon periodically flushes the log file buffers.
 func (l *loggingT) flushDaemon() {
+	// 使用time.NewTicker实现定时冲刷日志,注意go中的Ticker用法与其他语言定时器的思路不一样
+	// 其他语言一般是注册定时回调函数,时间周期到了调用回调函数,go的内部通过chan的阻塞实现,调用
+	// 的地方读取chan,定时到,向chan中写入数据,chan阻塞解除
 	for _ = range time.NewTicker(flushInterval).C {
+		// 冲刷所有日志到磁盘文件
 		l.lockAndFlushAll()
 	}
 }
@@ -894,8 +923,10 @@ func (l *loggingT) lockAndFlushAll() {
 // flushAll flushes all the logs and attempts to "sync" their data to disk.
 // l.mu is held.
 func (l *loggingT) flushAll() {
+	// 各个级别的日志文件分别冲刷
 	// Flush from fatal down, in case there's trouble flushing.
 	for s := fatalLog; s >= infoLog; s-- {
+		// 每个级别的日志当前都对应着一个文件
 		file := l.file[s]
 		if file != nil {
 			file.Flush() // ignore error
